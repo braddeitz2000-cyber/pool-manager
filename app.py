@@ -5,7 +5,7 @@ from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 import requests
 
-load_dotenv()
+load_dotenv(override=True)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
@@ -14,7 +14,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434/api/chat')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'phi3:mini')
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'tinyllama')
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
@@ -270,7 +270,10 @@ Be concise, practical, and friendly. Give actionable advice about pool chemistry
         data = response.json()
         return jsonify({'reply': data['message']['content']})
     except requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Ollama is not running. Start Ollama and pull the model (example: ollama pull phi3:mini).'}), 500
+        return jsonify({'error': 'Ollama is not running. Start Ollama and pull the model (example: ollama pull tinyllama).'}), 500
+    except requests.exceptions.HTTPError as e:
+        details = e.response.text if e.response is not None else str(e)
+        return jsonify({'error': f'Ollama request failed: {details}'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
