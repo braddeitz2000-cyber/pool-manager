@@ -3,7 +3,7 @@ from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, jsonify, flash
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
-import anthropic
+import requests
 
 load_dotenv()
 
@@ -13,7 +13,8 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///pool_manager.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
-claude = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
+OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434/api/chat')
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'phi3:mini')
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
@@ -253,13 +254,23 @@ Upcoming scheduled jobs:
 Be concise, practical, and friendly. Give actionable advice about pool chemistry, scheduling, customer management, pricing, and running a pool service business."""
 
     try:
-        response = claude.messages.create(
-            model='claude-opus-4-5',
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{'role': 'user', 'content': user_message}]
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                'model': OLLAMA_MODEL,
+                'stream': False,
+                'messages': [
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_message},
+                ],
+            },
+            timeout=90,
         )
-        return jsonify({'reply': response.content[0].text})
+        response.raise_for_status()
+        data = response.json()
+        return jsonify({'reply': data['message']['content']})
+    except requests.exceptions.ConnectionError:
+        return jsonify({'error': 'Ollama is not running. Start Ollama and pull the model (example: ollama pull phi3:mini).'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
