@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}{{ 'Edit' if customer else 'New' }} Customer — Pool Manager{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ 'Edit Customer' if customer else 'New Customer' }}</h1>
+  <a href="{{ url_for('customers') }}" class="btn btn-secondary">← Back</a>
+</div>
+<div class="card">
+  <form method="post">
+    <div class="field"><label>Name *</label><input name="name" required value="{{ customer.name if customer else '' }}"></div>
+    <div class="row">
+      <div class="field"><label>Phone</label><input name="phone" value="{{ customer.phone if customer else '' }}"></div>
+      <div class="field"><label>Email</label><input name="email" type="email" value="{{ customer.email if customer else '' }}"></div>
+    </div>
+    <div class="field"><label>Address</label><input name="address" value="{{ customer.address if customer else '' }}"></div>
+    <div class="field"><label>Pool Size (e.g. 15,000 gal)</label><input name="pool_size" value="{{ customer.pool_size if customer else '' }}"></div>
+    <div class="field"><label>Notes</label><textarea name="notes" rows="3">{{ customer.notes if customer else '' }}</textarea></div>
+    <button type="submit" class="btn btn-primary">{{ 'Save Changes' if customer else 'Add Customer' }}</button>
+  </form>
+</div>
+{% endblock %}

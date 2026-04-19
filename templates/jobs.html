@@ -1,0 +1,34 @@
+{% extends 'base.html' %}
+{% block title %}Jobs — Pool Manager{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Jobs</h1>
+  <a href="{{ url_for('new_job') }}" class="btn btn-primary">+ Schedule Job</a>
+</div>
+<div class="card">
+  {% if jobs %}
+  <table>
+    <thead><tr><th>Date</th><th>Customer</th><th>Job Type</th><th>Status</th><th>Price</th><th></th></tr></thead>
+    <tbody>
+    {% for j in jobs %}
+    <tr>
+      <td>{{ j.scheduled_date or '—' }}</td>
+      <td>{{ j.customer.name }}</td>
+      <td>{{ j.job_type }}</td>
+      <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+      <td>${{ "%.2f"|format(j.price) }}</td>
+      <td style="text-align:right">
+        <a href="{{ url_for('edit_job', id=j.id) }}" class="btn btn-secondary btn-sm">Edit</a>
+        <form style="display:inline" method="post" action="{{ url_for('delete_job', id=j.id) }}" onsubmit="return confirm('Delete this job?')">
+          <button class="btn btn-danger btn-sm">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:#718096">No jobs yet. <a href="{{ url_for('new_job') }}">Schedule your first job.</a></p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+{% block title %}Chemical Logs — Pool Manager{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Chemical Logs</h1>
+  <a href="{{ url_for('new_chemical_log') }}" class="btn btn-primary">+ Add Log</a>
+</div>
+<div class="card">
+  {% if logs %}
+  <table>
+    <thead><tr><th>Date</th><th>Customer</th><th>pH</th><th>Chlorine</th><th>Alkalinity</th><th>CYA</th><th>Notes</th></tr></thead>
+    <tbody>
+    {% for log in logs %}
+    <tr>
+      <td>{{ log.log_date }}</td>
+      <td>{{ log.customer.name }}</td>
+      <td>{{ log.ph }}</td>
+      <td>{{ log.chlorine }}</td>
+      <td>{{ log.alkalinity }}</td>
+      <td>{{ log.cyanuric_acid }}</td>
+      <td>{{ log.notes or '—' }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:#718096">No chemical logs yet. <a href="{{ url_for('new_chemical_log') }}">Add your first log.</a></p>
+  {% endif %}
+</div>
+{% endblock %}
