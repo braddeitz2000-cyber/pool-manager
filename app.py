@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, jsonify, flash
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, jsonify, flash, session
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
 import requests
@@ -15,6 +16,47 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434/api/chat')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'tinyllama')
+APP_USERNAME = os.getenv('APP_USERNAME', 'admin')
+APP_PASSWORD = os.getenv('APP_PASSWORD', 'change-me')
+
+# ── Auth helpers ─────────────────────────────────────────────────────────────
+
+def login_required(view):
+    @wraps(view)
+    def wrapped_view(*args, **kwargs):
+        if not session.get('authenticated'):
+            return redirect(url_for('login', next=request.path))
+        return view(*args, **kwargs)
+    return wrapped_view
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if session.get('authenticated'):
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+
+        if username == APP_USERNAME and password == APP_PASSWORD:
+            session['authenticated'] = True
+            session['username'] = username
+            flash('Welcome back to Hyperfocused.', 'success')
+            next_url = request.args.get('next') or url_for('dashboard')
+            return redirect(next_url)
+
+        flash('Invalid username or password.', 'danger')
+
+    return render_template('login.html')
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
 
 # ── Models ──────────────────────────────────────────────────────────────────
 
@@ -57,6 +99,7 @@ class ChemicalLog(db.Model):
 # ── Routes: Dashboard ────────────────────────────────────────────────────────
 
 @app.route('/')
+@login_required
 def dashboard():
     total_customers = Customer.query.count()
     scheduled_jobs = Job.query.filter_by(status='scheduled').count()
@@ -79,12 +122,14 @@ def dashboard():
 # ── Routes: Customers ────────────────────────────────────────────────────────
 
 @app.route('/customers')
+@login_required
 def customers():
     all_customers = Customer.query.order_by(Customer.name).all()
     return render_template('customers.html', customers=all_customers)
 
 
 @app.route('/customers/new', methods=['GET', 'POST'])
+@login_required
 def new_customer():
     if request.method == 'POST':
         c = Customer(
@@ -103,6 +148,7 @@ def new_customer():
 
 
 @app.route('/customers/<int:id>', methods=['GET', 'POST'])
+@login_required
 def edit_customer(id):
     c = Customer.query.get_or_404(id)
     if request.method == 'POST':
@@ -119,6 +165,7 @@ def edit_customer(id):
 
 
 @app.route('/customers/<int:id>/delete', methods=['POST'])
+@login_required
 def delete_customer(id):
     c = Customer.query.get_or_404(id)
     db.session.delete(c)
@@ -130,12 +177,14 @@ def delete_customer(id):
 # ── Routes: Jobs ─────────────────────────────────────────────────────────────
 
 @app.route('/jobs')
+@login_required
 def jobs():
     all_jobs = (Job.query.join(Customer).order_by(Job.scheduled_date.desc()).all())
     return render_template('jobs.html', jobs=all_jobs)
 
 
 @app.route('/jobs/new', methods=['GET', 'POST'])
+@login_required
 def new_job():
     customers_list = Customer.query.order_by(Customer.name).all()
     if request.method == 'POST':
@@ -156,6 +205,7 @@ def new_job():
 
 
 @app.route('/jobs/<int:id>', methods=['GET', 'POST'])
+@login_required
 def edit_job(id):
     j = Job.query.get_or_404(id)
     customers_list = Customer.query.order_by(Customer.name).all()
@@ -174,6 +224,7 @@ def edit_job(id):
 
 
 @app.route('/jobs/<int:id>/delete', methods=['POST'])
+@login_required
 def delete_job(id):
     j = Job.query.get_or_404(id)
     db.session.delete(j)
@@ -185,12 +236,14 @@ def delete_job(id):
 # ── Routes: Chemical Logs ────────────────────────────────────────────────────
 
 @app.route('/chemical-logs')
+@login_required
 def chemical_logs():
     logs = (ChemicalLog.query.join(Customer).order_by(ChemicalLog.log_date.desc()).all())
     return render_template('chemical_logs.html', logs=logs)
 
 
 @app.route('/chemical-logs/new', methods=['GET', 'POST'])
+@login_required
 def new_chemical_log():
     customers_list = Customer.query.order_by(Customer.name).all()
     if request.method == 'POST':
@@ -214,11 +267,13 @@ def new_chemical_log():
 # ── Routes: AI Assistant ─────────────────────────────────────────────────────
 
 @app.route('/assistant')
+@login_required
 def assistant():
     return render_template('assistant.html')
 
 
 @app.route('/assistant/chat', methods=['POST'])
+@login_required
 def assistant_chat():
     user_message = request.json.get('message', '').strip()
     if not user_message:
@@ -239,7 +294,7 @@ def assistant_chat():
         for j in upcoming
     ) or '  None scheduled'
 
-    system_prompt = f"""You are a helpful AI assistant for a pool service company. 
+    system_prompt = f"""You are a helpful AI assistant for Hyperfocused, a pool service management website.
 You help the owner manage customers, schedule jobs, track chemical levels, and run the business efficiently.
 
 Current business snapshot:
