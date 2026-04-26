@@ -43,6 +43,7 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     posts = db.relationship('Post', backref='author', lazy=True)
     replies = db.relationship('Reply', backref='author', lazy=True)
+    notifications = db.relationship('Notification', backref='recipient', lazy=True, cascade='all, delete-orphan')
 
 
 class Invite(db.Model):
@@ -90,6 +91,16 @@ class Attachment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    post_id = db.Column(db.Integer, db.ForeignKey('post.id'), nullable=False)
+    message = db.Column(db.String(255), nullable=False)
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    post = db.relationship('Post')
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def current_user():
@@ -101,7 +112,11 @@ def current_user():
 
 @app.context_processor
 def inject_user():
-    return {'current_user': current_user()}
+    user = current_user()
+    unread_count = 0
+    if user:
+        unread_count = Notification.query.filter_by(user_id=user.id, is_read=False).count()
+    return {'current_user': user, 'unread_count': unread_count}
 
 
 def login_required(view):
@@ -269,15 +284,26 @@ def new_post():
 @login_required
 def view_post(post_id):
     post = Post.query.get_or_404(post_id)
+    user = current_user()
+    if user:
+        Notification.query.filter_by(user_id=user.id, post_id=post.id, is_read=False).update({'is_read': True})
+        db.session.commit()
+
     if request.method == 'POST':
         body = request.form.get('body', '').strip()
         if not body:
             flash('Reply cannot be empty.', 'danger')
         else:
-            reply = Reply(body=body, author=current_user(), post=post)
+            reply = Reply(body=body, author=user, post=post)
             db.session.add(reply)
             db.session.flush()
             save_attachments(request.files.getlist('attachments'), reply=reply)
+            if post.author_id != user.id:
+                db.session.add(Notification(
+                    user_id=post.author_id,
+                    post_id=post.id,
+                    message=f'{user.display_name} replied to your help request: {post.title}'
+                ))
             db.session.commit()
             flash('Reply added.', 'success')
             return redirect(url_for('view_post', post_id=post.id))
@@ -297,6 +323,14 @@ def mark_solved(post_id):
         db.session.commit()
         flash('Post marked solved.', 'success')
     return redirect(url_for('view_post', post_id=post.id))
+
+
+@app.route('/notifications')
+@login_required
+def notifications():
+    user = current_user()
+    items = Notification.query.filter_by(user_id=user.id).order_by(Notification.created_at.desc()).all()
+    return render_template('notifications.html', notifications=items)
 
 
 @app.route('/uploads/<filename>')
