@@ -1,50 +1,191 @@
 import os
+import secrets
 from datetime import datetime
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, jsonify, flash, session
-from flask_sqlalchemy import SQLAlchemy
+from pathlib import Path
+
 from dotenv import load_dotenv
-import requests
+from flask import Flask, flash, redirect, render_template, request, send_from_directory, session, url_for
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 
 load_dotenv(override=True)
 
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = BASE_DIR / 'uploads'
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'mov', 'webm', 'm4v'}
+IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+VIDEO_EXTENSIONS = {'mp4', 'mov', 'webm', 'm4v'}
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///pool_manager.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///hyperfocused.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 250 * 1024 * 1024  # 250MB max photo/video upload
 
 db = SQLAlchemy(app)
-OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434/api/chat')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'tinyllama')
-APP_USERNAME = os.getenv('APP_USERNAME', 'admin')
-APP_PASSWORD = os.getenv('APP_PASSWORD', 'change-me')
 
-# ── Auth helpers ─────────────────────────────────────────────────────────────
+ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', os.getenv('APP_USERNAME', 'admin'))
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', os.getenv('APP_PASSWORD', 'change-me'))
+
+
+# ── Models ──────────────────────────────────────────────────────────────────
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    display_name = db.Column(db.String(120), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    posts = db.relationship('Post', backref='author', lazy=True)
+    replies = db.relationship('Reply', backref='author', lazy=True)
+
+
+class Invite(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(64), unique=True, nullable=False)
+    invited_name = db.Column(db.String(120))
+    created_by_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    used_at = db.Column(db.DateTime)
+    used_by_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+
+    @property
+    def is_used(self):
+        return self.used_at is not None
+
+
+class Post(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(160), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(80), default='General Help')
+    status = db.Column(db.String(30), default='open')
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    replies = db.relationship('Reply', backref='post', lazy=True, cascade='all, delete-orphan')
+    attachments = db.relationship('Attachment', backref='post', lazy=True, cascade='all, delete-orphan')
+
+
+class Reply(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    body = db.Column(db.Text, nullable=False)
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    post_id = db.Column(db.Integer, db.ForeignKey('post.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    attachments = db.relationship('Attachment', backref='reply', lazy=True, cascade='all, delete-orphan')
+
+
+class Attachment(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    media_type = db.Column(db.String(20), nullable=False)  # image or video
+    post_id = db.Column(db.Integer, db.ForeignKey('post.id'))
+    reply_id = db.Column(db.Integer, db.ForeignKey('reply.id'))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def current_user():
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    return User.query.get(user_id)
+
+
+@app.context_processor
+def inject_user():
+    return {'current_user': current_user()}
+
 
 def login_required(view):
     @wraps(view)
     def wrapped_view(*args, **kwargs):
-        if not session.get('authenticated'):
+        if not session.get('user_id'):
             return redirect(url_for('login', next=request.path))
         return view(*args, **kwargs)
     return wrapped_view
 
 
+def admin_required(view):
+    @wraps(view)
+    def wrapped_view(*args, **kwargs):
+        user = current_user()
+        if not user or not user.is_admin:
+            flash('Admin access required.', 'danger')
+            return redirect(url_for('board'))
+        return view(*args, **kwargs)
+    return wrapped_view
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def media_type_for(filename):
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext in IMAGE_EXTENSIONS:
+        return 'image'
+    if ext in VIDEO_EXTENSIONS:
+        return 'video'
+    return None
+
+
+def save_attachments(files, post=None, reply=None):
+    for file in files:
+        if not file or not file.filename:
+            continue
+        if not allowed_file(file.filename):
+            flash(f'Skipped unsupported file: {file.filename}', 'danger')
+            continue
+        original = secure_filename(file.filename)
+        ext = original.rsplit('.', 1)[1].lower()
+        stored = f'{datetime.utcnow().strftime("%Y%m%d%H%M%S")}_{secrets.token_hex(8)}.{ext}'
+        file.save(UPLOAD_FOLDER / stored)
+        db.session.add(Attachment(
+            filename=stored,
+            original_filename=original,
+            media_type=media_type_for(original),
+            post=post,
+            reply=reply,
+        ))
+
+
+def ensure_admin_user():
+    admin = User.query.filter_by(username=ADMIN_USERNAME).first()
+    if admin:
+        return
+    db.session.add(User(
+        username=ADMIN_USERNAME,
+        display_name='Admin',
+        password_hash=generate_password_hash(ADMIN_PASSWORD),
+        is_admin=True,
+    ))
+    db.session.commit()
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    if session.get('authenticated'):
-        return redirect(url_for('dashboard'))
+    if session.get('user_id'):
+        return redirect(url_for('board'))
 
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
+        user = User.query.filter_by(username=username).first()
 
-        if username == APP_USERNAME and password == APP_PASSWORD:
-            session['authenticated'] = True
-            session['username'] = username
+        if user and check_password_hash(user.password_hash, password):
+            session['user_id'] = user.id
             flash('Welcome back to Hyperfocused.', 'success')
-            next_url = request.args.get('next') or url_for('dashboard')
-            return redirect(next_url)
+            return redirect(request.args.get('next') or url_for('board'))
 
         flash('Invalid username or password.', 'danger')
 
@@ -58,284 +199,135 @@ def logout():
     return redirect(url_for('login'))
 
 
-# ── Models ──────────────────────────────────────────────────────────────────
+@app.route('/join/<token>', methods=['GET', 'POST'])
+def join(token):
+    invite = Invite.query.filter_by(token=token).first_or_404()
+    if invite.is_used:
+        flash('That invite has already been used. Ask the admin for a new invite.', 'danger')
+        return redirect(url_for('login'))
 
-class Customer(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(120), nullable=False)
-    phone = db.Column(db.String(20))
-    email = db.Column(db.String(120))
-    address = db.Column(db.String(200))
-    pool_size = db.Column(db.String(50))
-    notes = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    jobs = db.relationship('Job', backref='customer', lazy=True, cascade='all, delete-orphan')
-    chemical_logs = db.relationship('ChemicalLog', backref='customer', lazy=True, cascade='all, delete-orphan')
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        display_name = request.form.get('display_name', '').strip()
+        password = request.form.get('password', '')
+        confirm = request.form.get('confirm_password', '')
 
+        if not username or not display_name or not password:
+            flash('All fields are required.', 'danger')
+        elif password != confirm:
+            flash('Passwords do not match.', 'danger')
+        elif User.query.filter_by(username=username).first():
+            flash('That username is already taken.', 'danger')
+        else:
+            user = User(username=username, display_name=display_name, password_hash=generate_password_hash(password))
+            db.session.add(user)
+            db.session.flush()
+            invite.used_at = datetime.utcnow()
+            invite.used_by_id = user.id
+            db.session.commit()
+            session['user_id'] = user.id
+            flash('Account created. Welcome to Hyperfocused.', 'success')
+            return redirect(url_for('board'))
 
-class Job(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
-    job_type = db.Column(db.String(100), nullable=False)
-    scheduled_date = db.Column(db.Date)
-    status = db.Column(db.String(20), default='scheduled')  # scheduled, completed, cancelled
-    price = db.Column(db.Float, default=0.0)
-    notes = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-
-class ChemicalLog(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
-    log_date = db.Column(db.Date, default=datetime.utcnow)
-    ph = db.Column(db.Float)
-    chlorine = db.Column(db.Float)
-    alkalinity = db.Column(db.Float)
-    cyanuric_acid = db.Column(db.Float)
-    notes = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    return render_template('join.html', invite=invite)
 
 
-# ── Routes: Dashboard ────────────────────────────────────────────────────────
+# ── Board ───────────────────────────────────────────────────────────────────
 
 @app.route('/')
 @login_required
-def dashboard():
-    total_customers = Customer.query.count()
-    scheduled_jobs = Job.query.filter_by(status='scheduled').count()
-    completed_jobs = Job.query.filter_by(status='completed').count()
-    upcoming_jobs = (Job.query
-                     .filter_by(status='scheduled')
-                     .join(Customer)
-                     .order_by(Job.scheduled_date)
-                     .limit(5)
-                     .all())
-    revenue = db.session.query(db.func.sum(Job.price)).filter_by(status='completed').scalar() or 0
-    return render_template('dashboard.html',
-                           total_customers=total_customers,
-                           scheduled_jobs=scheduled_jobs,
-                           completed_jobs=completed_jobs,
-                           upcoming_jobs=upcoming_jobs,
-                           revenue=revenue)
+def board():
+    posts = Post.query.order_by(Post.created_at.desc()).all()
+    open_posts = Post.query.filter_by(status='open').count()
+    solved_posts = Post.query.filter_by(status='solved').count()
+    return render_template('board.html', posts=posts, open_posts=open_posts, solved_posts=solved_posts)
 
 
-# ── Routes: Customers ────────────────────────────────────────────────────────
-
-@app.route('/customers')
+@app.route('/posts/new', methods=['GET', 'POST'])
 @login_required
-def customers():
-    all_customers = Customer.query.order_by(Customer.name).all()
-    return render_template('customers.html', customers=all_customers)
-
-
-@app.route('/customers/new', methods=['GET', 'POST'])
-@login_required
-def new_customer():
+def new_post():
     if request.method == 'POST':
-        c = Customer(
-            name=request.form['name'],
-            phone=request.form.get('phone'),
-            email=request.form.get('email'),
-            address=request.form.get('address'),
-            pool_size=request.form.get('pool_size'),
-            notes=request.form.get('notes'),
-        )
-        db.session.add(c)
-        db.session.commit()
-        flash('Customer added!', 'success')
-        return redirect(url_for('customers'))
-    return render_template('customer_form.html', customer=None)
+        title = request.form.get('title', '').strip()
+        body = request.form.get('body', '').strip()
+        category = request.form.get('category', 'General Help').strip() or 'General Help'
+
+        if not title or not body:
+            flash('Title and details are required.', 'danger')
+        else:
+            post = Post(title=title, body=body, category=category, author=current_user())
+            db.session.add(post)
+            db.session.flush()
+            save_attachments(request.files.getlist('attachments'), post=post)
+            db.session.commit()
+            flash('Help request posted.', 'success')
+            return redirect(url_for('view_post', post_id=post.id))
+
+    return render_template('post_form.html')
 
 
-@app.route('/customers/<int:id>', methods=['GET', 'POST'])
+@app.route('/posts/<int:post_id>', methods=['GET', 'POST'])
 @login_required
-def edit_customer(id):
-    c = Customer.query.get_or_404(id)
+def view_post(post_id):
+    post = Post.query.get_or_404(post_id)
     if request.method == 'POST':
-        c.name = request.form['name']
-        c.phone = request.form.get('phone')
-        c.email = request.form.get('email')
-        c.address = request.form.get('address')
-        c.pool_size = request.form.get('pool_size')
-        c.notes = request.form.get('notes')
+        body = request.form.get('body', '').strip()
+        if not body:
+            flash('Reply cannot be empty.', 'danger')
+        else:
+            reply = Reply(body=body, author=current_user(), post=post)
+            db.session.add(reply)
+            db.session.flush()
+            save_attachments(request.files.getlist('attachments'), reply=reply)
+            db.session.commit()
+            flash('Reply added.', 'success')
+            return redirect(url_for('view_post', post_id=post.id))
+
+    return render_template('post_detail.html', post=post)
+
+
+@app.route('/posts/<int:post_id>/solve', methods=['POST'])
+@login_required
+def mark_solved(post_id):
+    post = Post.query.get_or_404(post_id)
+    user = current_user()
+    if user.id != post.author_id and not user.is_admin:
+        flash('Only the post author or admin can mark this solved.', 'danger')
+    else:
+        post.status = 'solved'
         db.session.commit()
-        flash('Customer updated!', 'success')
-        return redirect(url_for('customers'))
-    return render_template('customer_form.html', customer=c)
+        flash('Post marked solved.', 'success')
+    return redirect(url_for('view_post', post_id=post.id))
 
 
-@app.route('/customers/<int:id>/delete', methods=['POST'])
+@app.route('/uploads/<filename>')
 @login_required
-def delete_customer(id):
-    c = Customer.query.get_or_404(id)
-    db.session.delete(c)
-    db.session.commit()
-    flash('Customer deleted.', 'info')
-    return redirect(url_for('customers'))
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
 
 
-# ── Routes: Jobs ─────────────────────────────────────────────────────────────
+# ── Admin invites ───────────────────────────────────────────────────────────
 
-@app.route('/jobs')
+@app.route('/admin/invites', methods=['GET', 'POST'])
 @login_required
-def jobs():
-    all_jobs = (Job.query.join(Customer).order_by(Job.scheduled_date.desc()).all())
-    return render_template('jobs.html', jobs=all_jobs)
-
-
-@app.route('/jobs/new', methods=['GET', 'POST'])
-@login_required
-def new_job():
-    customers_list = Customer.query.order_by(Customer.name).all()
+@admin_required
+def invites():
+    new_invite_url = None
     if request.method == 'POST':
-        date_str = request.form.get('scheduled_date')
-        j = Job(
-            customer_id=int(request.form['customer_id']),
-            job_type=request.form['job_type'],
-            scheduled_date=datetime.strptime(date_str, '%Y-%m-%d').date() if date_str else None,
-            status=request.form.get('status', 'scheduled'),
-            price=float(request.form.get('price') or 0),
-            notes=request.form.get('notes'),
-        )
-        db.session.add(j)
+        invited_name = request.form.get('invited_name', '').strip()
+        invite = Invite(token=secrets.token_urlsafe(32), invited_name=invited_name, created_by_id=current_user().id)
+        db.session.add(invite)
         db.session.commit()
-        flash('Job scheduled!', 'success')
-        return redirect(url_for('jobs'))
-    return render_template('job_form.html', job=None, customers=customers_list)
+        new_invite_url = url_for('join', token=invite.token, _external=True)
+        flash('One-time invite created. Copy it now and send it directly to that employee.', 'success')
+
+    all_invites = Invite.query.order_by(Invite.created_at.desc()).all()
+    return render_template('invites.html', invites=all_invites, new_invite_url=new_invite_url)
 
 
-@app.route('/jobs/<int:id>', methods=['GET', 'POST'])
-@login_required
-def edit_job(id):
-    j = Job.query.get_or_404(id)
-    customers_list = Customer.query.order_by(Customer.name).all()
-    if request.method == 'POST':
-        date_str = request.form.get('scheduled_date')
-        j.customer_id = int(request.form['customer_id'])
-        j.job_type = request.form['job_type']
-        j.scheduled_date = datetime.strptime(date_str, '%Y-%m-%d').date() if date_str else None
-        j.status = request.form.get('status', 'scheduled')
-        j.price = float(request.form.get('price') or 0)
-        j.notes = request.form.get('notes')
-        db.session.commit()
-        flash('Job updated!', 'success')
-        return redirect(url_for('jobs'))
-    return render_template('job_form.html', job=j, customers=customers_list)
-
-
-@app.route('/jobs/<int:id>/delete', methods=['POST'])
-@login_required
-def delete_job(id):
-    j = Job.query.get_or_404(id)
-    db.session.delete(j)
-    db.session.commit()
-    flash('Job deleted.', 'info')
-    return redirect(url_for('jobs'))
-
-
-# ── Routes: Chemical Logs ────────────────────────────────────────────────────
-
-@app.route('/chemical-logs')
-@login_required
-def chemical_logs():
-    logs = (ChemicalLog.query.join(Customer).order_by(ChemicalLog.log_date.desc()).all())
-    return render_template('chemical_logs.html', logs=logs)
-
-
-@app.route('/chemical-logs/new', methods=['GET', 'POST'])
-@login_required
-def new_chemical_log():
-    customers_list = Customer.query.order_by(Customer.name).all()
-    if request.method == 'POST':
-        date_str = request.form.get('log_date')
-        log = ChemicalLog(
-            customer_id=int(request.form['customer_id']),
-            log_date=datetime.strptime(date_str, '%Y-%m-%d').date() if date_str else datetime.utcnow().date(),
-            ph=float(request.form.get('ph') or 0),
-            chlorine=float(request.form.get('chlorine') or 0),
-            alkalinity=float(request.form.get('alkalinity') or 0),
-            cyanuric_acid=float(request.form.get('cyanuric_acid') or 0),
-            notes=request.form.get('notes'),
-        )
-        db.session.add(log)
-        db.session.commit()
-        flash('Chemical log saved!', 'success')
-        return redirect(url_for('chemical_logs'))
-    return render_template('chemical_log_form.html', log=None, customers=customers_list)
-
-
-# ── Routes: AI Assistant ─────────────────────────────────────────────────────
-
-@app.route('/assistant')
-@login_required
-def assistant():
-    return render_template('assistant.html')
-
-
-@app.route('/assistant/chat', methods=['POST'])
-@login_required
-def assistant_chat():
-    user_message = request.json.get('message', '').strip()
-    if not user_message:
-        return jsonify({'error': 'No message provided'}), 400
-
-    # Build context from the database
-    total_customers = Customer.query.count()
-    scheduled_jobs = Job.query.filter_by(status='scheduled').count()
-    completed_jobs = Job.query.filter_by(status='completed').count()
-    revenue = db.session.query(db.func.sum(Job.price)).filter_by(status='completed').scalar() or 0
-    upcoming = (Job.query.filter_by(status='scheduled')
-                .join(Customer)
-                .order_by(Job.scheduled_date)
-                .limit(5)
-                .all())
-    upcoming_text = '\n'.join(
-        f"  - {j.scheduled_date}: {j.customer.name} ({j.job_type}, ${j.price:.2f})"
-        for j in upcoming
-    ) or '  None scheduled'
-
-    system_prompt = f"""You are a helpful AI assistant for Hyperfocused, a pool service management website.
-You help the owner manage customers, schedule jobs, track chemical levels, and run the business efficiently.
-
-Current business snapshot:
-- Total customers: {total_customers}
-- Scheduled jobs: {scheduled_jobs}
-- Completed jobs: {completed_jobs}
-- Total revenue from completed jobs: ${revenue:.2f}
-
-Upcoming scheduled jobs:
-{upcoming_text}
-
-Be concise, practical, and friendly. Give actionable advice about pool chemistry, scheduling, customer management, pricing, and running a pool service business."""
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                'model': OLLAMA_MODEL,
-                'stream': False,
-                'messages': [
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': user_message},
-                ],
-            },
-            timeout=90,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return jsonify({'reply': data['message']['content']})
-    except requests.exceptions.ConnectionError:
-        return jsonify({'error': 'Ollama is not running. Start Ollama and pull the model (example: ollama pull tinyllama).'}), 500
-    except requests.exceptions.HTTPError as e:
-        details = e.response.text if e.response is not None else str(e)
-        return jsonify({'error': f'Ollama request failed: {details}'}), 500
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-# ── Init ─────────────────────────────────────────────────────────────────────
+# ── Init ────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+        ensure_admin_user()
     app.run(debug=True)
